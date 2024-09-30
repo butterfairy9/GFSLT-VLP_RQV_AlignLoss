@@ -29,7 +29,8 @@ from transformers.models.mbart.modeling_mbart import shift_tokens_right
 from transformers.models.mbart.modeling_mbart import MBartLearnedPositionalEmbedding, MBartEncoderLayer, _expand_mask
 
 from collections import OrderedDict
-
+#keren added
+from vector_quantize_pytorch import ResidualVQ
 
 import copy
 import math
@@ -299,45 +300,58 @@ class gloss_free_model(nn.Module):
         self.args = args
 
         self.backbone = FeatureExtracter(frozen=_('freeze_backbone', False))
-        # self.mbart = MBartForConditionalGeneration.from_pretrained(config['model']['visual_encoder'])
         self.mbart = config_decoder(config)
  
         if config['model']['sign_proj']:
-            self.sign_emb = V_encoder(emb_size=embed_dim,feature_size=embed_dim, config = config)
+            self.sign_emb = V_encoder(emb_size=embed_dim, feature_size=embed_dim, config=config)
             self.embed_scale = math.sqrt(embed_dim) if config['training']['scale_embedding'] else 1.0
         else:
             self.sign_emb = nn.Identity()
             self.embed_scale = 1.0
         
+        # Add ResidualVQ layer
+        self.residual_vq = ResidualVQ(
+            dim = embed_dim,
+            num_quantizers = 8,  #  adjust this
+            codebook_size = 1024,  # adjust this
+            decay = 0.8,  #  adjust this
+            commitment_weight = 1.0  # adjust this
+        )
+
     def share_forward(self, src_input):
-        
         frames_feature = self.backbone(src_input['input_ids'].cuda(), src_input['src_length_batch'])
         attention_mask = src_input['attention_mask']
 
         inputs_embeds = self.sign_emb(frames_feature)
         inputs_embeds = self.embed_scale * inputs_embeds
 
-        return inputs_embeds, attention_mask
+        # Apply ResidualVQ
+        quantized, indices, commit_loss = self.residual_vq(inputs_embeds)
 
-    def forward(self,src_input, tgt_input ):
-        
-        inputs_embeds, attention_mask = self.share_forward(src_input)
+        return quantized, attention_mask, commit_loss
 
-        out = self.mbart(inputs_embeds = inputs_embeds,
+    def forward(self, src_input, tgt_input):
+        quantized, attention_mask, commit_loss = self.share_forward(src_input)
+
+        out = self.mbart(inputs_embeds = quantized,
                     attention_mask = attention_mask.cuda(),
-                    # decoder_input_ids = tgt_input['input_ids'].cuda(),
                     labels = tgt_input['input_ids'].cuda(),
                     decoder_attention_mask = tgt_input['attention_mask'].cuda(),
                     return_dict = True,
                     )
-        return out['logits']
-    
+        
+        # Add commit_loss to the total loss
+        out['loss'] += commit_loss
 
-    def generate(self,src_input,max_new_tokens,num_beams,decoder_start_token_id ):
-        inputs_embeds, attention_mask = self.share_forward(src_input)
+        return out['logits'], commit_loss
 
-        out = self.mbart.generate(inputs_embeds = inputs_embeds,
-                    attention_mask = attention_mask.cuda(),max_new_tokens=max_new_tokens,num_beams = num_beams,
-                                decoder_start_token_id=decoder_start_token_id
-                            )
+    def generate(self, src_input, max_new_tokens, num_beams, decoder_start_token_id):
+        quantized, attention_mask, _ = self.share_forward(src_input)
+
+        out = self.mbart.generate(inputs_embeds = quantized,
+                    attention_mask = attention_mask.cuda(),
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    decoder_start_token_id=decoder_start_token_id
+                    )
         return out
